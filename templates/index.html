@@ -20,7 +20,7 @@
             {%- for repository in repositories %}
             <tr class="{% if path.is_some() %}has-parent{% endif %}">
                 <td>
-                    <a href="/{% if let Some(path) = path %}{{ path }}/{% endif %}{{ repository.name }}">
+                    <a href="/{% if let Some(path) = path %}{{ path }}/{% endif %}{{ repository.name }}/about">
                         {{- repository.name -}}
                     </a>
                 </td>
