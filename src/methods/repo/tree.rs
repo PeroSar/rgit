@@ -4,7 +4,7 @@ use std::{
 };
 
 use askama::Template;
-use axum::{extract::Query, http, response::IntoResponse, response::Response, Extension};
+use axum::{extract::Query, response::IntoResponse, Extension};
 use serde::Deserialize;
 
 use crate::{
@@ -14,16 +14,16 @@ use crate::{
         filters,
         repo::{ChildPath, Repository, RepositoryPath, Result},
     },
-    Git,
+    Git, ResponseEither,
 };
 
 #[derive(Deserialize)]
 pub struct UriQuery {
     id: Option<String>,
-    #[serde(rename = "h")]
-    branch: Option<String>,
     #[serde(default)]
     raw: bool,
+    #[serde(rename = "h")]
+    branch: Option<Arc<str>>,
 }
 
 impl Display for UriQuery {
@@ -50,6 +50,7 @@ pub struct TreeView {
     pub repo: Repository,
     pub items: Vec<TreeItem>,
     pub query: UriQuery,
+    pub branch: Option<Arc<str>>,
 }
 
 #[derive(Template)]
@@ -57,6 +58,7 @@ pub struct TreeView {
 pub struct FileView {
     pub repo: Repository,
     pub file: FileWithContent,
+    pub branch: Option<Arc<str>>,
 }
 
 pub async fn handle(
@@ -65,29 +67,30 @@ pub async fn handle(
     Extension(ChildPath(child_path)): Extension<ChildPath>,
     Extension(git): Extension<Arc<Git>>,
     Query(query): Query<UriQuery>,
-) -> Result<Response> {
-    let open_repo = git.repo(repository_path).await?;
+) -> Result<impl IntoResponse> {
+    let open_repo = git.repo(repository_path, query.branch.clone()).await?;
 
     Ok(
         match open_repo
-            .path(
-                child_path,
-                query.id.as_deref(),
-                query.branch.clone(),
-                !query.raw,
-            )
+            .path(child_path, query.id.as_deref(), !query.raw)
             .await?
         {
-            PathDestination::Tree(items) => into_response(&TreeView { repo, items, query }),
-            PathDestination::File(file) if query.raw => {
-                let headers = [(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("text/plain"),
-                )];
-
-                (headers, file.content).into_response()
+            PathDestination::Tree(items) => {
+                ResponseEither::Left(ResponseEither::Left(into_response(TreeView {
+                    repo,
+                    items,
+                    branch: query.branch.clone(),
+                    query,
+                })))
             }
-            PathDestination::File(file) => into_response(&FileView { repo, file }),
+            PathDestination::File(file) if query.raw => ResponseEither::Right(file.content),
+            PathDestination::File(file) => {
+                ResponseEither::Left(ResponseEither::Right(into_response(FileView {
+                    repo,
+                    file,
+                    branch: query.branch,
+                })))
+            }
         },
     )
 }

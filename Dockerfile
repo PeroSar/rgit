@@ -1,12 +1,13 @@
-FROM rust:1.71-slim AS builder
+FROM rust:1.78-slim AS builder
 
-RUN apt-get update && apt-get install -y libssl-dev pkg-config
+RUN rustup component add rustfmt
+RUN apt-get update && apt-get install -y libssl-dev pkg-config clang
 
 COPY . /sources
 WORKDIR /sources
 RUN cargo build --release
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Install git and cleanup package lists.
 # This is required for git-http-backend to work.

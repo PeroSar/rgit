@@ -1,7 +1,9 @@
 #![deny(clippy::pedantic)]
 
 use std::{
+    borrow::Cow,
     fmt::{Display, Formatter},
+    future::IntoFuture,
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
@@ -9,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use askama::Template;
 use axum::{
     body::Body,
@@ -20,20 +23,29 @@ use axum::{
 };
 use bat::assets::HighlightingAssets;
 use clap::Parser;
+use database::schema::SCHEMA_VERSION;
+use nom::AsBytes;
 use once_cell::sync::{Lazy, OnceCell};
-use sha2::digest::FixedOutput;
-use sha2::Digest;
-use sled::Db;
+use rocksdb::{Options, SliceTransform};
+use sha2::{digest::FixedOutput, Digest};
 use syntect::html::ClassStyle;
 use tokio::{
+    net::TcpListener,
     signal::unix::{signal, SignalKind},
     sync::mpsc,
 };
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer};
 use tower_layer::layer_fn;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::{git::Git, layers::logger::LoggingMiddleware};
+use crate::{
+    database::schema::prefixes::{
+        COMMIT_COUNT_FAMILY, COMMIT_FAMILY, REFERENCE_FAMILY, REPOSITORY_FAMILY, TAG_FAMILY,
+    },
+    git::Git,
+    layers::logger::LoggingMiddleware,
+};
 
 mod database;
 mod git;
@@ -52,9 +64,9 @@ static DARK_HIGHLIGHT_CSS_HASH: OnceCell<Box<str>> = OnceCell::new();
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 pub struct Args {
-    /// Path to a directory in which the Sled database should be stored, will be created if it doesn't already exist
+    /// Path to a directory in which the `RocksDB` database should be stored, will be created if it doesn't already exist
     ///
-    /// The Sled database is very quick to generate, so this can be pointed to temporary storage
+    /// The `RocksDB` database is very quick to generate, so this can be pointed to temporary storage
     #[clap(short, long, value_parser)]
     db_store: PathBuf,
     /// The socket address to bind to (eg. 0.0.0.0:3333)
@@ -64,6 +76,9 @@ pub struct Args {
     /// Configures the metadata refresh interval (eg. "never" or "60s")
     #[clap(long, default_value_t = RefreshInterval::Duration(Duration::from_secs(300)))]
     refresh_interval: RefreshInterval,
+    /// Configures the request timeout.
+    #[clap(long, default_value_t = Duration::from_secs(10).into())]
+    request_timeout: humantime::Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,19 +111,30 @@ impl FromStr for RefreshInterval {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), anyhow::Error> {
     let args: Args = Args::parse();
 
-    let subscriber = tracing_subscriber::fmt();
-    #[cfg(debug_assertions)]
-    let subscriber = subscriber.pretty();
-    subscriber.init();
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
 
-    let db = sled::Config::default()
-        .use_compression(true)
-        .path(&args.db_store)
-        .open()
-        .unwrap();
+    let console_layer = console_subscriber::spawn();
+
+    let logger_layer = tracing_subscriber::fmt::layer();
+    #[cfg(debug_assertions)]
+    let logger_layer = logger_layer.pretty();
+
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive("tokio=trace".parse()?)
+        .add_directive("runtime=trace".parse()?);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(logger_layer)
+        .init();
+
+    let db = open_db(&args)?;
 
     let indexer_wakeup_task =
         run_indexer(db.clone(), args.scan_path.clone(), args.refresh_interval);
@@ -181,18 +207,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(static_favicon(include_bytes!("../statics/favicon.ico"))),
         )
         .fallback(methods::repo::service)
+        .layer(TimeoutLayer::new(args.request_timeout.into()))
         .layer(layer_fn(LoggingMiddleware))
         .layer(Extension(Arc::new(Git::new(syntax_set))))
         .layer(Extension(db))
         .layer(Extension(Arc::new(args.scan_path)))
         .layer(CorsLayer::new());
 
-    let server = axum::Server::bind(&args.bind_address)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    let listener = TcpListener::bind(&args.bind_address).await?;
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    let server = axum::serve(listener, app).into_future();
 
     tokio::select! {
-        res = server => res.map_err(Box::from),
-        res = indexer_wakeup_task => res.map_err(Box::from),
+        res = server => res.context("failed to run server"),
+        res = indexer_wakeup_task => res.context("failed to run indexer"),
         _ = tokio::signal::ctrl_c() => {
             info!("Received ctrl-c, shutting down");
             Ok(())
@@ -200,8 +228,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn open_db(args: &Args) -> Result<Arc<rocksdb::DB>, anyhow::Error> {
+    loop {
+        let mut db_options = Options::default();
+        db_options.create_missing_column_families(true);
+        db_options.create_if_missing(true);
+
+        let mut commit_family_options = Options::default();
+        commit_family_options.set_prefix_extractor(SliceTransform::create(
+            "commit_prefix",
+            |input| input.split(|&c| c == b'\0').next().unwrap_or(input),
+            None,
+        ));
+
+        let mut tag_family_options = Options::default();
+        tag_family_options.set_prefix_extractor(SliceTransform::create_fixed_prefix(
+            std::mem::size_of::<u64>(),
+        )); // repository id prefix
+
+        let db = rocksdb::DB::open_cf_with_opts(
+            &db_options,
+            &args.db_store,
+            vec![
+                (COMMIT_FAMILY, commit_family_options),
+                (REPOSITORY_FAMILY, Options::default()),
+                (TAG_FAMILY, tag_family_options),
+                (REFERENCE_FAMILY, Options::default()),
+                (COMMIT_COUNT_FAMILY, Options::default()),
+            ],
+        )?;
+
+        let needs_schema_regen = match db.get("schema_version")? {
+            Some(v) if v.as_bytes() != SCHEMA_VERSION.as_bytes() => Some(Some(v)),
+            Some(_) => None,
+            None => {
+                db.put("schema_version", SCHEMA_VERSION)?;
+                None
+            }
+        };
+
+        if let Some(version) = needs_schema_regen {
+            let old_version = version
+                .as_deref()
+                .map_or(Cow::Borrowed("unknown"), String::from_utf8_lossy);
+
+            warn!("Clearing outdated database ({old_version} != {SCHEMA_VERSION})");
+
+            drop(db);
+            rocksdb::DB::destroy(&Options::default(), &args.db_store)?;
+        } else {
+            break Ok(Arc::new(db));
+        }
+    }
+}
+
 async fn run_indexer(
-    db: Db,
+    db: Arc<rocksdb::DB>,
     scan_path: PathBuf,
     refresh_interval: RefreshInterval,
 ) -> Result<(), tokio::task::JoinError> {
@@ -251,17 +333,41 @@ pub fn build_asset_hash(v: &[u8]) -> Box<str> {
     Box::from(out)
 }
 
-#[instrument(skip(t))]
-pub fn into_response<T: Template>(t: &T) -> Response {
-    match t.render() {
-        Ok(body) => {
-            let headers = [(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_static(T::MIME_TYPE),
-            )];
+pub struct TemplateResponse<T> {
+    template: T,
+}
 
-            (headers, body).into_response()
+impl<T: Template> IntoResponse for TemplateResponse<T> {
+    #[instrument(skip_all)]
+    fn into_response(self) -> Response {
+        match self.template.render() {
+            Ok(body) => {
+                let headers = [(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(T::MIME_TYPE),
+                )];
+
+                (headers, body).into_response()
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub fn into_response<T: Template>(template: T) -> impl IntoResponse {
+    TemplateResponse { template }
+}
+
+pub enum ResponseEither<A, B> {
+    Left(A),
+    Right(B),
+}
+
+impl<A: IntoResponse, B: IntoResponse> IntoResponse for ResponseEither<A, B> {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Left(a) => a.into_response(),
+            Self::Right(b) => b.into_response(),
+        }
     }
 }

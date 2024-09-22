@@ -1,6 +1,8 @@
+{% import "macros/link.html" as link %}
 {% extends "repo/base.html" %}
 
 {% block content %}
+<div class="table-responsive">
 <table class="commit-info">
     <tbody>
     <tr>
@@ -23,15 +25,20 @@
             <td>
                 {% match tagged_object %}
                     {% when crate::git::TaggedObject::Commit with (commit) %}
-                        <a href="/{{ repo.display() }}/commit?id={{ commit }}">commit {{ commit|truncate(10) }}...</a>
+                        <a href="/{{ repo.display() }}/commit?id={{ commit }}{% call link::maybe_branch_suffix(branch) %}">commit {{ commit|truncate(10) }}...</a>
                     {% when crate::git::TaggedObject::Tree with (tree) %}
                         tree {{ tree }}
                 {% endmatch %}
             </td>
         </tr>
     {% endif %}
+    <tr>
+        <th>download</th>
+        <td colspan="2"><pre><a href="/{{ repo.display() }}/snapshot?h={{ tag.name }}">{{ tag.name }}.tar.gz</a></pre></td>
+    </tr>
     </tbody>
 </table>
+</div>
 
 <pre class="h2-first-line">{{ tag.message }}</pre>
 {% endblock %}

@@ -1,7 +1,7 @@
 [package]
 name = "rgit"
 description = "A gitweb/cgit-like interface"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = [ "Jordan Doyle <jordan@doyle.la>" ]
 license = "WTFPL"
@@ -11,17 +11,19 @@ license = "WTFPL"
 [dependencies]
 askama = "0.12.0"
 anyhow = "1.0"
-axum = { version = "0.6.19", features = ["headers", "macros"] }
-axum-macros = "0.3.7"
-bat = { version = "0.23.0", default-features = false, features = ["build-assets"] }
+axum = { version = "0.7", features = ["macros"] }
+axum-macros = "0.4.1"
+bat = { version = "0.24.0", default-features = false, features = ["build-assets"] }
 bytes = "1.5"
 bincode = "1.3"
-comrak = "0.18.0"
+console-subscriber = { version = "0.2", features = ["parking_lot"] }
+comrak = "0.21.0"
 clap = { version = "4.4.10", features = ["cargo", "derive"] }
 futures = "0.3"
 git2 = "0.18.0"
 hex = "0.4"
 humantime = "2.1"
+itertools = "0.12"
 rust-ini = "0.20"
 nom = "7.1"
 md5 = "0.7"
@@ -29,24 +31,28 @@ moka = { version = "0.12.0", features = ["future"] }
 once_cell = "1.18"
 path-clean = "1.0.1"
 parking_lot = "0.12"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 sha2 = "0.10"
 syntect = "5"
-sled = { version = "0.34", features = ["compression"] }
+rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
+tar = "0.4"
+flate2 = "1.0"
 time = { version = "0.3", features = ["serde"] }
 timeago = { version = "0.4.2", default-features = false }
-tokio = { version = "1.19", features = ["full"] }
-tokio-util = { version = "0.7.3", features = ["io"] }
+tokio = { version = "1.19", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.10", features = ["io"] }
+tokio-stream = "0.1"
 tower = "0.4"
 tower-service = "0.3"
 tower-layer = "0.3"
-tower-http = { version = "0.4.4", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "timeout"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unix_mode = "0.1"
-uuid = { version = "1.6", features = ["v4"] }
+uuid = { version = "1.7", features = ["v4"] }
 httparse = "1.7"
 yoke = { version = "0.7.1", features = ["derive"] }
+rand = "0.8.5"
 
 [build-dependencies]
 anyhow = "1.0"

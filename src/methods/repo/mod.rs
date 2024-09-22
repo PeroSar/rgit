@@ -4,20 +4,20 @@ mod diff;
 mod log;
 mod refs;
 mod smart_git;
+mod snapshot;
 mod summary;
 mod tag;
 mod tree;
 
 use std::{
     collections::BTreeMap,
-    fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use axum::{
-    body::HttpBody,
+    body::Body,
     handler::HandlerWithoutStateExt,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -32,6 +32,7 @@ use self::{
     log::handle as handle_log,
     refs::handle as handle_refs,
     smart_git::handle as handle_smart_git,
+    snapshot::handle as handle_snapshot,
     summary::handle as handle_summary,
     tag::handle as handle_tag,
     tree::handle as handle_tree,
@@ -45,13 +46,7 @@ pub const DEFAULT_BRANCHES: [&str; 2] = ["refs/heads/master", "refs/heads/main"]
 
 // this is some wicked, wicked abuse of axum right here...
 #[allow(clippy::trait_duplication_in_bounds)] // clippy seems a bit.. lost
-pub async fn service<ReqBody>(mut request: Request<ReqBody>) -> Response
-where
-    ReqBody: HttpBody + Send + Debug + 'static,
-    <ReqBody as HttpBody>::Data: Send + Sync,
-    bytes::Bytes: From<ReqBody::Data>,
-    <ReqBody as HttpBody>::Error: std::error::Error + Send + Sync,
-{
+pub async fn service(mut request: Request<Body>) -> Response {
     let scan_path = request
         .extensions()
         .get::<Arc<PathBuf>>()
@@ -75,8 +70,6 @@ where
 
     let mut service = match uri_parts.pop() {
         Some("about") => h!(handle_about),
-        // TODO: https://man.archlinux.org/man/git-http-backend.1.en
-        // TODO: GIT_PROTOCOL
         Some("refs") if uri_parts.last() == Some(&"info") => {
             uri_parts.pop();
             h!(handle_smart_git)
@@ -89,6 +82,7 @@ where
         Some("diff") => h!(handle_diff),
         Some("patch") => h!(handle_patch),
         Some("tag") => h!(handle_tag),
+        Some("snapshot") => h!(handle_snapshot),
         Some(v) => {
             uri_parts.push(v);
 
@@ -119,6 +113,16 @@ where
 
     let uri = uri_parts.into_iter().collect::<PathBuf>().clean();
     let path = scan_path.join(&uri);
+
+    let db = request
+        .extensions()
+        .get::<Arc<rocksdb::DB>>()
+        .expect("db extension missing");
+    if path.as_os_str().is_empty()
+        || !crate::database::schema::repository::Repository::exists(db, &uri).unwrap_or_default()
+    {
+        return RepositoryNotFound.into_response();
+    }
 
     request.extensions_mut().insert(ChildPath(child_path));
     request.extensions_mut().insert(Repository(uri));
@@ -157,6 +161,14 @@ impl Deref for RepositoryPath {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct RepositoryNotFound;
+
+impl IntoResponse for RepositoryNotFound {
+    fn into_response(self) -> Response {
+        (StatusCode::NOT_FOUND, "Repository not found").into_response()
+    }
+}
 
 pub struct Error(anyhow::Error);
 

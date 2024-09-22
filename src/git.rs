@@ -1,34 +1,38 @@
 use std::{
     borrow::Cow,
     ffi::OsStr,
+    fmt,
     fmt::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
-use comrak::{ComrakOptions, ComrakPlugins};
+use anyhow::{anyhow, Context, Result};
+use axum::response::IntoResponse;
+use bytes::{BufMut, Bytes, BytesMut};
+use comrak::{ComrakPlugins, Options};
 use git2::{
-    BranchType, DiffFormat, DiffLineType, DiffOptions, DiffStatsFormat, Email, EmailCreateOptions,
-    ObjectType, Oid, Signature,
+    DiffFormat, DiffLineType, DiffOptions, DiffStatsFormat, Email, EmailCreateOptions, ObjectType,
+    Oid, Signature, TreeWalkResult,
 };
 use moka::future::Cache;
 use parking_lot::Mutex;
 use syntect::{
-    html::{ClassStyle, ClassedHTMLGenerator},
     parsing::SyntaxSet,
+    parsing::{BasicScopeStackOp, ParseState, Scope, ScopeStack, SCOPE_REPO},
     util::LinesWithEndings,
 };
 use time::OffsetDateTime;
-use tracing::instrument;
+use tracing::{error, instrument, warn};
 
 use crate::syntax_highlight::ComrakSyntectAdapter;
 
+type ReadmeCacheKey = (PathBuf, Option<Arc<str>>);
+
 pub struct Git {
     commits: Cache<Oid, Arc<Commit>>,
-    readme_cache: Cache<PathBuf, Option<(ReadmeFormat, Arc<str>)>>,
+    readme_cache: Cache<ReadmeCacheKey, Option<(ReadmeFormat, Arc<str>)>>,
     syntax_set: SyntaxSet,
 }
 
@@ -51,19 +55,27 @@ impl Git {
 
 impl Git {
     #[instrument(skip(self))]
-    pub async fn repo(self: Arc<Self>, repo_path: PathBuf) -> Result<Arc<OpenRepository>> {
+    pub async fn repo(
+        self: Arc<Self>,
+        repo_path: PathBuf,
+        branch: Option<Arc<str>>,
+    ) -> Result<Arc<OpenRepository>> {
         let repo = tokio::task::spawn_blocking({
             let repo_path = repo_path.clone();
             move || git2::Repository::open(repo_path)
         })
         .await
         .context("Failed to join Tokio task")?
-        .context("Failed to open repository")?;
+        .map_err(|err| {
+            error!("{}", err);
+            anyhow!("Failed to open repository")
+        })?;
 
         Ok(Arc::new(OpenRepository {
             git: self,
             cache_key: repo_path,
             repo: Mutex::new(repo),
+            branch,
         }))
     }
 }
@@ -72,6 +84,7 @@ pub struct OpenRepository {
     git: Arc<Git>,
     cache_key: PathBuf,
     repo: Mutex<git2::Repository>,
+    branch: Option<Arc<str>>,
 }
 
 impl OpenRepository {
@@ -79,7 +92,6 @@ impl OpenRepository {
         self: Arc<Self>,
         path: Option<PathBuf>,
         tree_id: Option<&str>,
-        branch: Option<String>,
         formatted: bool,
     ) -> Result<PathDestination> {
         let tree_id = tree_id
@@ -93,14 +105,13 @@ impl OpenRepository {
             let mut tree = if let Some(tree_id) = tree_id {
                 repo.find_tree(tree_id)
                     .context("Couldn't find tree with given id")?
-            } else if let Some(branch) = branch {
-                let branch = repo.find_branch(&branch, BranchType::Local)?;
-                branch
-                    .get()
+            } else if let Some(branch) = &self.branch {
+                let reference = repo.resolve_reference_from_short_name(branch)?;
+                reference
                     .peel_to_tree()
-                    .context("Couldn't find tree for branch")?
+                    .context("Couldn't find tree for reference")?
             } else {
-                let head = repo.head()?;
+                let head = repo.head().context("Failed to find HEAD")?;
                 head.peel_to_tree()
                     .context("Couldn't find tree from HEAD")?
             };
@@ -120,10 +131,20 @@ impl OpenRepository {
                         .extension()
                         .or_else(|| path.file_name())
                         .map_or_else(|| Cow::Borrowed(""), OsStr::to_string_lossy);
-                    let content = if formatted {
-                        format_file(blob.content(), &extension, &self.git.syntax_set)?
-                    } else {
-                        String::from_utf8_lossy(blob.content()).to_string()
+                    let content = match (formatted, blob.is_binary()) {
+                        (true, true) => Content::Binary(vec![]),
+                        (true, false) => Content::Text(
+                            format_file(
+                                &String::from_utf8_lossy(blob.content()),
+                                &extension,
+                                &self.git.syntax_set,
+                            )?
+                            .into(),
+                        ),
+                        (false, true) => Content::Binary(blob.content().to_vec()),
+                        (false, false) => Content::Text(
+                            String::from_utf8_lossy(blob.content()).to_string().into(),
+                        ),
                     };
 
                     return Ok(PathDestination::File(FileWithContent {
@@ -175,16 +196,14 @@ impl OpenRepository {
     }
 
     #[instrument(skip(self))]
-    pub async fn tag_info(self: Arc<Self>, tag_name: &str) -> Result<DetailedTag> {
-        let reference = format!("refs/tags/{tag_name}");
-        let tag_name = tag_name.to_string();
-
+    pub async fn tag_info(self: Arc<Self>) -> Result<DetailedTag> {
         tokio::task::spawn_blocking(move || {
+            let tag_name = self.branch.clone().context("no tag given")?;
             let repo = self.repo.lock();
 
             let tag = repo
-                .find_reference(&reference)
-                .context("Given reference does not exist in repository")?
+                .find_reference(&format!("refs/tags/{tag_name}"))
+                .context("Given tag does not exist in repository")?
                 .peel_to_tag()
                 .context("Couldn't get to a tag from the given reference")?;
             let tag_target = tag.target().context("Couldn't find tagged object")?;
@@ -218,11 +237,16 @@ impl OpenRepository {
         let git = self.git.clone();
 
         git.readme_cache
-            .try_get_with(self.cache_key.clone(), async move {
+            .try_get_with((self.cache_key.clone(), self.branch.clone()), async move {
                 tokio::task::spawn_blocking(move || {
                     let repo = self.repo.lock();
 
-                    let head = repo.head().context("Couldn't find HEAD of repository")?;
+                    let head = if let Some(reference) = &self.branch {
+                        repo.resolve_reference_from_short_name(reference)?
+                    } else {
+                        repo.head().context("Couldn't find HEAD of repository")?
+                    };
+
                     let commit = head.peel_to_commit().context(
                         "Couldn't find the commit that the HEAD of the repository refers to",
                     )?;
@@ -263,12 +287,27 @@ impl OpenRepository {
             .await
     }
 
+    pub async fn default_branch(self: Arc<Self>) -> Result<Option<String>> {
+        tokio::task::spawn_blocking(move || {
+            let repo = self.repo.lock();
+            let head = repo.head().context("Couldn't find HEAD of repository")?;
+            Ok(head.shorthand().map(ToString::to_string))
+        })
+        .await
+        .context("Failed to join Tokio task")?
+    }
+
     #[instrument(skip(self))]
     pub async fn latest_commit(self: Arc<Self>) -> Result<Commit> {
         tokio::task::spawn_blocking(move || {
             let repo = self.repo.lock();
 
-            let head = repo.head().context("Couldn't find HEAD of repository")?;
+            let head = if let Some(reference) = &self.branch {
+                repo.resolve_reference_from_short_name(reference)?
+            } else {
+                repo.head().context("Couldn't find HEAD of repository")?
+            };
+
             let commit = head
                 .peel_to_commit()
                 .context("Couldn't find commit HEAD of repository refers to")?;
@@ -283,6 +322,87 @@ impl OpenRepository {
         })
         .await
         .context("Failed to join Tokio task")?
+    }
+
+    #[instrument(skip_all)]
+    pub async fn archive(
+        self: Arc<Self>,
+        res: tokio::sync::mpsc::Sender<Result<Bytes, anyhow::Error>>,
+        cont: tokio::sync::oneshot::Sender<()>,
+        commit: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        const BUFFER_CAP: usize = 512 * 1024;
+
+        let commit = commit
+            .map(Oid::from_str)
+            .transpose()
+            .context("failed to build oid")?;
+
+        tokio::task::spawn_blocking(move || {
+            let buffer = BytesMut::with_capacity(BUFFER_CAP + 1024);
+
+            let flate = flate2::write::GzEncoder::new(buffer.writer(), flate2::Compression::fast());
+            let mut archive = tar::Builder::new(flate);
+
+            let repo = self.repo.lock();
+
+            let tree = if let Some(commit) = commit {
+                repo.find_commit(commit)?.tree()?
+            } else if let Some(reference) = &self.branch {
+                repo.resolve_reference_from_short_name(reference)?
+                    .peel_to_tree()?
+            } else {
+                repo.head()
+                    .context("Couldn't find HEAD of repository")?
+                    .peel_to_tree()?
+            };
+
+            // tell the web server it can send response headers to the requester
+            if cont.send(()).is_err() {
+                return Err(anyhow!("requester gone"));
+            }
+
+            let mut callback = |root: &str, entry: &git2::TreeEntry| -> TreeWalkResult {
+                if let Ok(blob) = entry.to_object(&repo).unwrap().peel_to_blob() {
+                    let path =
+                        Path::new(root).join(String::from_utf8_lossy(entry.name_bytes()).as_ref());
+
+                    let mut header = tar::Header::new_gnu();
+                    if let Err(error) = header.set_path(&path) {
+                        warn!(%error, "Attempted to write invalid path to archive");
+                        return TreeWalkResult::Skip;
+                    }
+                    header.set_size(blob.size() as u64);
+                    #[allow(clippy::cast_sign_loss)]
+                    header.set_mode(entry.filemode() as u32);
+                    header.set_cksum();
+
+                    if let Err(error) = archive.append(&header, blob.content()) {
+                        error!(%error, "Failed to write blob to archive");
+                        return TreeWalkResult::Abort;
+                    }
+                }
+
+                if archive.get_ref().get_ref().get_ref().len() >= BUFFER_CAP {
+                    let b = archive.get_mut().get_mut().get_mut().split().freeze();
+                    if let Err(error) = res.blocking_send(Ok(b)) {
+                        error!(%error, "Failed to send buffer to client");
+                        return TreeWalkResult::Abort;
+                    }
+                }
+
+                TreeWalkResult::Ok
+            };
+
+            tree.walk(git2::TreeWalkMode::PreOrder, &mut callback)?;
+
+            res.blocking_send(Ok(archive.into_inner()?.finish()?.into_inner().freeze()))?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -322,7 +442,17 @@ fn parse_and_transform_markdown(s: &str, syntax_set: &SyntaxSet) -> String {
     let highlighter = ComrakSyntectAdapter { syntax_set };
     plugins.render.codefence_syntax_highlighter = Some(&highlighter);
 
-    comrak::markdown_to_html_with_plugins(s, &ComrakOptions::default(), &plugins)
+    // enable gfm extensions
+    // https://github.github.com/gfm/
+    let mut options = Options::default();
+    options.extension.autolink = true;
+    options.extension.footnotes = true;
+    options.extension.strikethrough = true;
+    options.extension.table = true;
+    options.extension.tagfilter = true;
+    options.extension.tasklist = true;
+
+    comrak::markdown_to_html_with_plugins(s, &options, &plugins)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -359,18 +489,38 @@ pub struct File {
 #[derive(Debug)]
 pub struct FileWithContent {
     pub metadata: File,
-    pub content: String,
+    pub content: Content,
 }
 
 #[derive(Debug)]
-pub struct Branch {
-    pub name: String,
-    pub commit: Commit,
+pub enum Content {
+    Text(Cow<'static, str>),
+    Binary(Vec<u8>),
 }
 
-#[derive(Debug)]
-pub struct Remote {
-    pub name: String,
+impl IntoResponse for Content {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http;
+
+        match self {
+            Self::Text(t) => {
+                let headers = [(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=UTF-8"),
+                )];
+
+                (headers, t).into_response()
+            }
+            Self::Binary(b) => {
+                let headers = [(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/octet-stream"),
+                )];
+
+                (headers, b).into_response()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -381,7 +531,7 @@ pub enum TaggedObject {
 
 #[derive(Debug)]
 pub struct DetailedTag {
-    pub name: String,
+    pub name: Arc<str>,
     pub tagger: Option<CommitUser>,
     pub message: String,
     pub tagged_object: Option<TaggedObject>,
@@ -510,8 +660,8 @@ fn fetch_diff_and_stats(
         1,
         1,
         &commit.id(),
-        "",
-        "",
+        commit.summary().unwrap_or(""),
+        commit.body().unwrap_or(""),
         &commit.author(),
         &mut EmailCreateOptions::default(),
     )
@@ -529,25 +679,159 @@ fn fetch_diff_and_stats(
     Ok((diff_plain.freeze(), diff_output, diff_stats))
 }
 
-fn format_file(content: &[u8], extension: &str, syntax_set: &SyntaxSet) -> Result<String> {
-    let content = String::from_utf8_lossy(content);
+fn format_file(content: &str, extension: &str, syntax_set: &SyntaxSet) -> Result<String> {
+    let mut out = String::new();
+    format_file_inner(&mut out, content, extension, syntax_set, true)?;
+    Ok(out)
+}
 
+// TODO: this is in some serious need of refactoring
+fn format_file_inner(
+    out: &mut String,
+    content: &str,
+    extension: &str,
+    syntax_set: &SyntaxSet,
+    code_tag: bool,
+) -> Result<()> {
     let syntax = syntax_set
         .find_syntax_by_extension(extension)
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let mut html_generator =
-        ClassedHTMLGenerator::new_with_class_style(syntax, syntax_set, ClassStyle::Spaced);
+    let mut parse_state = ParseState::new(syntax);
 
-    for line in LinesWithEndings::from(&content) {
-        html_generator
-            .parse_html_for_line_which_includes_newline(line)
-            .context("Couldn't parse line of file")?;
+    let mut scope_stack = ScopeStack::new();
+    let mut span_empty = false;
+    let mut span_start = 0;
+    let mut open_spans = Vec::new();
+
+    for line in LinesWithEndings::from(content) {
+        if code_tag {
+            out.push_str("<code>");
+        }
+
+        if line.len() > 2048 {
+            // avoid highlighting overly complex lines
+            let line = if code_tag { line.trim_end() } else { line };
+            write!(out, "{}", Escape(line))?;
+        } else {
+            let mut cur_index = 0;
+            let ops = parse_state.parse_line(line, syntax_set)?;
+            out.reserve(line.len() + ops.len() * 8);
+
+            if code_tag {
+                for scope in &open_spans {
+                    out.push_str("<span class=\"");
+                    scope_to_classes(out, *scope);
+                    out.push_str("\">");
+                }
+            }
+
+            // mostly copied from syntect, but slightly modified to keep track
+            // of open spans, so we can open and close them for each line
+            for &(i, ref op) in &ops {
+                if i > cur_index {
+                    let prefix = &line[cur_index..i];
+                    let prefix = if code_tag {
+                        prefix.trim_end_matches('\n')
+                    } else {
+                        prefix
+                    };
+                    write!(out, "{}", Escape(prefix))?;
+
+                    span_empty = false;
+                    cur_index = i;
+                }
+
+                scope_stack.apply_with_hook(op, |basic_op, _| match basic_op {
+                    BasicScopeStackOp::Push(scope) => {
+                        span_start = out.len();
+                        span_empty = true;
+                        out.push_str("<span class=\"");
+                        open_spans.push(scope);
+                        scope_to_classes(out, scope);
+                        out.push_str("\">");
+                    }
+                    BasicScopeStackOp::Pop => {
+                        open_spans.pop();
+                        if span_empty {
+                            out.truncate(span_start);
+                        } else {
+                            out.push_str("</span>");
+                        }
+                        span_empty = false;
+                    }
+                })?;
+            }
+
+            let line = if code_tag { line.trim_end() } else { line };
+            if line.len() > cur_index {
+                write!(out, "{}", Escape(&line[cur_index..]))?;
+            }
+
+            if code_tag {
+                for _scope in &open_spans {
+                    out.push_str("</span>");
+                }
+            }
+        }
+
+        if code_tag {
+            out.push_str("</code>\n");
+        }
     }
 
-    Ok(format!(
-        "<code>{}</code>",
-        html_generator.finalize().replace('\n', "</code>\n<code>")
-    ))
+    if !code_tag {
+        for _scope in &open_spans {
+            out.push_str("</span>");
+        }
+    }
+
+    Ok(())
+}
+
+fn scope_to_classes(s: &mut String, scope: Scope) {
+    let repo = SCOPE_REPO.lock().unwrap();
+    for i in 0..(scope.len()) {
+        let atom = scope.atom_at(i as usize);
+        let atom_s = repo.atom_str(atom);
+        if i != 0 {
+            s.push(' ');
+        }
+        s.push_str(atom_s);
+    }
+}
+
+// Copied from syntect as it isn't exposed from there.
+pub struct Escape<'a>(pub &'a str);
+
+impl<'a> fmt::Display for Escape<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Escape(s) = *self;
+        let pile_o_bits = s;
+        let mut last = 0;
+        for (i, ch) in s.bytes().enumerate() {
+            match ch as char {
+                '<' | '>' | '&' | '\'' | '"' => {
+                    fmt.write_str(&pile_o_bits[last..i])?;
+                    let s = match ch as char {
+                        '>' => "&gt;",
+                        '<' => "&lt;",
+                        '&' => "&amp;",
+                        '\'' => "&#39;",
+                        '"' => "&quot;",
+                        _ => unreachable!(),
+                    };
+                    fmt.write_str(s)?;
+                    last = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if last < s.len() {
+            fmt.write_str(&pile_o_bits[last..])?;
+        }
+        Ok(())
+    }
 }
 
 #[instrument(skip(diff, syntax_set))]
@@ -578,16 +862,13 @@ fn format_diff(diff: &git2::Diff<'_>, syntax_set: &SyntaxSet) -> Result<String> 
         } else {
             Cow::Borrowed("patch")
         };
-        let syntax = syntax_set
-            .find_syntax_by_extension(&extension)
-            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-        let mut html_generator =
-            ClassedHTMLGenerator::new_with_class_style(syntax, syntax_set, ClassStyle::Spaced);
-        let _res = html_generator.parse_html_for_line_which_includes_newline(&line);
+
         if let Some(class) = class {
             let _ = write!(diff_output, r#"<span class="diff-{class}">"#);
         }
-        diff_output.push_str(&html_generator.finalize());
+
+        let _res = format_file_inner(&mut diff_output, &line, &extension, syntax_set, false);
+
         if class.is_some() {
             diff_output.push_str("</span>");
         }

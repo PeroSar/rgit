@@ -11,7 +11,10 @@ use axum::{
 use crate::{
     git::Commit,
     http, into_response,
-    methods::repo::{commit::UriQuery, Repository, RepositoryPath, Result},
+    methods::{
+        filters,
+        repo::{commit::UriQuery, Repository, RepositoryPath, Result},
+    },
     Git,
 };
 
@@ -20,6 +23,7 @@ use crate::{
 pub struct View {
     pub repo: Repository,
     pub commit: Arc<Commit>,
+    pub branch: Option<Arc<str>>,
 }
 
 pub async fn handle(
@@ -27,15 +31,19 @@ pub async fn handle(
     Extension(RepositoryPath(repository_path)): Extension<RepositoryPath>,
     Extension(git): Extension<Arc<Git>>,
     Query(query): Query<UriQuery>,
-) -> Result<Response> {
-    let open_repo = git.repo(repository_path).await?;
+) -> Result<impl IntoResponse> {
+    let open_repo = git.repo(repository_path, query.branch.clone()).await?;
     let commit = if let Some(commit) = query.id {
         open_repo.commit(&commit).await?
     } else {
         Arc::new(open_repo.latest_commit().await?)
     };
 
-    Ok(into_response(&View { repo, commit }))
+    Ok(into_response(View {
+        repo,
+        commit,
+        branch: query.branch,
+    }))
 }
 
 pub async fn handle_plain(
@@ -43,7 +51,7 @@ pub async fn handle_plain(
     Extension(git): Extension<Arc<Git>>,
     Query(query): Query<UriQuery>,
 ) -> Result<Response> {
-    let open_repo = git.repo(repository_path).await?;
+    let open_repo = git.repo(repository_path, query.branch).await?;
     let commit = if let Some(commit) = query.id {
         open_repo.commit(&commit).await?
     } else {

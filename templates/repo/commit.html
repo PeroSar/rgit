@@ -1,3 +1,4 @@
+{% import "macros/link.html" as link %}
 {% extends "repo/base.html" %}
 
 {% block head %}
@@ -8,6 +9,7 @@
 {% block commit_nav_class %}active{% endblock %}
 
 {% block content %}
+<div class="table-responsive">
 <table class="commit-info">
     <tbody>
     <tr>
@@ -22,20 +24,25 @@
     </tr>
     <tr>
         <th>commit</th>
-        <td colspan="2"><pre><a href="/{{ repo.display() }}/commit?id={{ commit.oid() }}" class="no-style">{{ commit.oid() }}</a> <a href="/{{ repo.display() }}/patch?id={{ commit.oid() }}">[patch]</a></pre></td>
+        <td colspan="2"><pre><a href="/{{ repo.display() }}/commit?id={{ commit.oid() }}{% call link::maybe_branch_suffix(branch) %}" class="no-style">{{ commit.oid() }}</a> <a href="/{{ repo.display() }}/patch?id={{ commit.oid() }}">[patch]</a></pre></td>
     </tr>
     <tr>
         <th>tree</th>
-        <td colspan="2"><pre><a href="/{{ repo.display() }}/tree?id={{ commit.tree() }}" class="no-style">{{ commit.tree() }}</a></pre></td>
+        <td colspan="2"><pre><a href="/{{ repo.display() }}/tree?id={{ commit.tree() }}{% call link::maybe_branch_suffix(branch) %}" class="no-style">{{ commit.tree() }}</a></pre></td>
     </tr>
     {%- for parent in commit.parents() %}
     <tr>
         <th>parent</th>
-        <td colspan="2"><pre><a href="/{{ repo.display() }}/commit?id={{ parent }}" class="no-style">{{ parent }}</a></pre></td>
+        <td colspan="2"><pre><a href="/{{ repo.display() }}/commit?id={{ parent }}{% call link::maybe_branch_suffix(branch) %}" class="no-style">{{ parent }}</a></pre></td>
     </tr>
     {%- endfor %}
+    <tr>
+        <th>download</th>
+        <td colspan="2"><pre><a href="/{{ repo.display() }}/snapshot?{% if let Some(id) = id %}id={{ id }}{% else %}h={{ dl_branch }}{% endif %}">{{ id.as_deref().unwrap_or(dl_branch.as_ref()) }}.tar.gz</a></pre></td>
+    </tr>
     </tbody>
 </table>
+</div>
 
 <h2>{{ commit.summary() }}</h2>
 <pre>{{ commit.body() }}</pre>
